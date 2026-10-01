@@ -2,19 +2,29 @@ package http
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/majd/ipatool/v2/pkg/authdiag"
 	"howett.net/plist"
 )
 
 const appStoreAuthPath = "/WebObjects/MZFinance.woa/wa/authenticate"
+
+func isAppStoreAuthenticationPath(path string) bool {
+	return path == appStoreAuthPath || path == appStoreAuthPath+"/"
+}
 
 var (
 	documentXMLPattern = regexp.MustCompile(`(?is)<Document\b[^>]*>(.*)</Document>`)
@@ -100,7 +110,7 @@ func NewClient[R interface{}](args Args) Client[R] {
 			Timeout: 0,
 			Jar:     args.CookieJar,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) > 0 && via[len(via)-1].URL.Path == appStoreAuthPath {
+				if len(via) > 0 && isAppStoreAuthenticationPath(via[len(via)-1].URL.Path) {
 					return http.ErrUseLastResponse
 				}
 
@@ -112,7 +122,11 @@ func NewClient[R interface{}](args Args) Client[R] {
 	}
 }
 
-func (c *client[R]) Send(req Request) (Result[R], error) {
+func (c *client[R]) Send(req Request) (result Result[R], sendErr error) {
+	diagnostic := c.authenticationDiagnostic(req)
+	if diagnostic != nil {
+		defer func() { diagnostic.finish(sendErr) }()
+	}
 	var (
 		data []byte
 		err  error
@@ -143,34 +157,198 @@ func (c *client[R]) Send(req Request) (Result[R], error) {
 		request.Header.Set(HeaderAppleActionSignature, base64.StdEncoding.EncodeToString(signature))
 	}
 
+	if diagnostic != nil {
+		diagnostic.event.SignaturePresent = request.Header.Get(HeaderAppleActionSignature) != ""
+		if c.internalClient.Jar != nil {
+			diagnostic.event.CookieCountBefore = len(c.internalClient.Jar.Cookies(request.URL))
+		}
+		event := diagnostic.event
+		event.Kind = "http_request"
+		authdiag.Emit(event)
+		diagnostic.outcome = "network_error"
+	}
 	res, err := c.internalClient.Do(request)
 	if err != nil {
+		if diagnostic != nil {
+			diagnostic.outcome = authenticationTransportOutcome(err)
+			if c.internalClient.Jar != nil {
+				diagnostic.event.CookieCountAfter = len(c.internalClient.Jar.Cookies(request.URL))
+			}
+		}
 		return Result[R]{}, fmt.Errorf("request failed: %w", err)
 	}
 	defer res.Body.Close()
+	if diagnostic != nil {
+		diagnostic.response(res)
+		if c.internalClient.Jar != nil {
+			diagnostic.event.CookieCountAfter = len(c.internalClient.Jar.Cookies(request.URL))
+		}
+		diagnostic.outcome = "cookie_save_error"
+	}
 
 	err = c.cookieJar.Save()
 	if err != nil {
 		return Result[R]{}, fmt.Errorf("failed to save cookies: %w", err)
 	}
+	if diagnostic != nil {
+		diagnostic.outcome = "error"
+	}
 
 	if req.ResponseFormat == ResponseFormatJSON {
-		return c.handleJSONResponse(res)
+		return c.handleJSONResponse(res, diagnostic)
 	}
 
 	if req.ResponseFormat == ResponseFormatRaw {
-		return c.handleRawResponse(res)
+		return c.handleRawResponse(res, diagnostic)
 	}
 
 	if req.ResponseFormat == ResponseFormatXML {
-		return c.handleXMLResponse(res)
+		return c.handleXMLResponse(res, diagnostic)
 	}
 
 	return Result[R]{}, fmt.Errorf("content type is not supported (%s)", req.ResponseFormat)
 }
 
-func (c *client[R]) handleRawResponse(res *http.Response) (Result[R], error) {
+// This context contains only allowlisted observations. Raw bodies, header
+// values, URLs, errors and account identifiers must never be retained in it.
+type authenticationHTTPDiagnostic struct {
+	event    authdiag.Event
+	started  time.Time
+	received bool
+	outcome  string
+}
+
+func (c *client[R]) authenticationDiagnostic(req Request) *authenticationHTTPDiagnostic {
+	if !c.authentication || !authdiag.Enabled() {
+		return nil
+	}
+	authPathTrailingSlash := false
+	if parsed, err := url.Parse(req.URL); err == nil {
+		authPathTrailingSlash = parsed.Path == appStoreAuthPath+"/"
+	}
+	return &authenticationHTTPDiagnostic{
+		event: authdiag.Event{
+			LoginID: req.DiagnosticLoginID, RequestID: authdiag.NextRequestID(),
+			Stage: req.DiagnosticStage, Attempt: req.DiagnosticAttempt, Retry: req.DiagnosticRetry,
+			Host: authdiag.Host(req.URL), AuthPathTrailingSlash: authPathTrailingSlash,
+		},
+		started: time.Now(), outcome: "request_error",
+	}
+}
+
+func (d *authenticationHTTPDiagnostic) response(res *http.Response) {
+	d.received = true
+	d.event.Status = res.StatusCode
+	d.event.ContentType = authenticationContentType(res.Header.Get("Content-Type"))
+	d.event.SetCookieCount = len(res.Header.Values("Set-Cookie"))
+	d.event.LocationPresent = len(res.Header.Values("Location")) != 0
+	d.event.CorrelationIDPresent = len(res.Header.Values("X-Apple-Jingle-Correlation-Key")) != 0
+	d.event.RetryAfterPresent = len(res.Header.Values("Retry-After")) != 0
+	if d.event.LocationPresent {
+		location := res.Header.Get("Location")
+		d.event.RedirectHost = authdiag.Host(location)
+		if parsed, err := url.Parse(location); err == nil {
+			d.event.LocationAuthPath = isAppStoreAuthenticationPath(parsed.Path)
+		}
+	}
+	switch res.Proto {
+	case "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0":
+		d.event.Protocol = res.Proto
+	default:
+		d.event.Protocol = "other"
+	}
+	d.event.TLSVersion = "none"
+	if res.TLS != nil {
+		switch res.TLS.Version {
+		case tls.VersionTLS12:
+			d.event.TLSVersion = "TLS1.2"
+		case tls.VersionTLS13:
+			d.event.TLSVersion = "TLS1.3"
+		default:
+			d.event.TLSVersion = "other"
+		}
+	}
+}
+
+func (d *authenticationHTTPDiagnostic) finish(err error) {
+	d.event.Kind = "http_error"
+	if d.received {
+		d.event.Kind = "http_response"
+	}
+	d.event.Outcome = d.outcome
+	if err == nil {
+		d.event.Outcome = "ok"
+	}
+	d.event.DurationMS = time.Since(d.started).Milliseconds()
+	authdiag.Emit(d.event)
+}
+
+func authenticationContentType(value string) string {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(value, ";", 2)[0]))
+	switch mediaType {
+	case "", "text/html", "text/xml", "application/xml", "application/x-plist", "application/octet-stream", "text/plain", "application/json":
+		return mediaType
+	default:
+		return "other"
+	}
+}
+
+func observeAuthenticationBody(body []byte, readErr error, contexts []*authenticationHTTPDiagnostic) {
+	if len(contexts) == 0 || contexts[0] == nil {
+		return
+	}
+	d := contexts[0]
+	d.event.BodyBytes = int64(len(body))
+	d.event.BodyKind = authenticationBodyKind(body)
+	if readErr != nil {
+		d.outcome = "body_read_error"
+	}
+}
+
+func authenticationBodyKind(body []byte) string {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return "empty"
+	}
+	// Classify a prefix using slices of the bytes already read for decoding;
+	// do not make a second body copy or persist a sample or digest.
+	for _, prefix := range []string{"<!doctype html", "<html", "<head", "<body"} {
+		if len(body) >= len(prefix) && bytes.EqualFold(body[:len(prefix)], []byte(prefix)) {
+			return "html"
+		}
+	}
+	for _, prefix := range []string{"bplist", "<?xml", "<plist", "<dict", "<document"} {
+		if len(body) >= len(prefix) && bytes.EqualFold(body[:len(prefix)], []byte(prefix)) {
+			return "plist"
+		}
+	}
+	return "other"
+}
+
+func authenticationTransportOutcome(err error) string {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns_error"
+	}
+	var certificateErr *tls.CertificateVerificationError
+	var recordErr tls.RecordHeaderError
+	var authorityErr x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidCertificateErr x509.CertificateInvalidError
+	if errors.As(err, &certificateErr) || errors.As(err, &recordErr) ||
+		errors.As(err, &authorityErr) || errors.As(err, &hostnameErr) || errors.As(err, &invalidCertificateErr) {
+		return "tls_error"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	return "network_error"
+}
+
+func (c *client[R]) handleRawResponse(res *http.Response, diagnostic ...*authenticationHTTPDiagnostic) (Result[R], error) {
 	body, err := io.ReadAll(res.Body)
+	observeAuthenticationBody(body, err, diagnostic)
 	if err != nil {
 		return Result[R]{}, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -205,8 +383,9 @@ func (*client[R]) NewRequest(method, url string, body io.Reader) (*http.Request,
 	return req, nil
 }
 
-func (c *client[R]) handleJSONResponse(res *http.Response) (Result[R], error) {
+func (c *client[R]) handleJSONResponse(res *http.Response, diagnostic ...*authenticationHTTPDiagnostic) (Result[R], error) {
 	body, err := io.ReadAll(res.Body)
+	observeAuthenticationBody(body, err, diagnostic)
 	if err != nil {
 		return Result[R]{}, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -224,8 +403,9 @@ func (c *client[R]) handleJSONResponse(res *http.Response) (Result[R], error) {
 	}, nil
 }
 
-func (c *client[R]) handleXMLResponse(res *http.Response) (Result[R], error) {
+func (c *client[R]) handleXMLResponse(res *http.Response, diagnostic ...*authenticationHTTPDiagnostic) (Result[R], error) {
 	body, err := io.ReadAll(res.Body)
+	observeAuthenticationBody(body, err, diagnostic)
 	if err != nil {
 		return Result[R]{}, fmt.Errorf("failed to read response body: %w", err)
 	}

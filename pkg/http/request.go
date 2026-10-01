@@ -7,6 +7,12 @@ type Request struct {
 	Payload        Payload
 	ActionSigner   ActionSigner
 	ResponseFormat ResponseFormat
+	// Diagnostic fields correlate opt-in authentication metadata without
+	// carrying account identifiers, payloads, or credentials.
+	DiagnosticLoginID uint64
+	DiagnosticStage   string
+	DiagnosticAttempt int
+	DiagnosticRetry   int
 }
 
 type ActionSigner interface {

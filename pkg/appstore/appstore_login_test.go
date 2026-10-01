@@ -1,10 +1,16 @@
 package appstore
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	gohttp "net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/majd/ipatool/v2/pkg/http"
@@ -13,6 +19,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
+	"howett.net/plist"
 )
 
 var _ = Describe("AppStore (Login)", func() {
@@ -113,6 +120,32 @@ var _ = Describe("AppStore (Login)", func() {
 		)
 	})
 
+	DescribeTable("redacts sensitive redirect locations from authentication errors",
+		func(status int, location, diagnostic string) {
+			response := http.Result[loginResult]{StatusCode: status, Headers: map[string]string{"Location": location}}
+
+			retry, _, err := as.parseLoginResponse(&response, 1, "")
+
+			Expect(retry).To(BeFalse())
+			Expect(err).To(MatchError(fmt.Sprintf("invalid authentication redirect (HTTP %d): %s", status, diagnostic)))
+			for _, secret := range []string{"account-secret", "password-secret", "path-secret", "query-secret", "fragment-secret"} {
+				Expect(err.Error()).NotTo(ContainSubstring(secret))
+			}
+		},
+		Entry("301 omits userinfo, arbitrary path, query and fragment", 301,
+			"https://account-secret:password-secret@example.test/path-secret?token=query-secret#fragment-secret",
+			`scheme="https" host="example.test" expected-auth-path=false`),
+		Entry("302 omits userinfo, arbitrary path, query and fragment", 302,
+			"https://account-secret:password-secret@example.test/path-secret?token=query-secret#fragment-secret",
+			`scheme="https" host="example.test" expected-auth-path=false`),
+		Entry("301 omits the URL embedded in a parse error", 301,
+			"https://account-secret:password-secret@example.test/path-secret%zz?token=query-secret#fragment-secret",
+			"malformed Location"),
+		Entry("302 omits the URL embedded in a parse error", 302,
+			"https://account-secret:password-secret@example.test/path-secret%zz?token=query-secret#fragment-secret",
+			"malformed Location"),
+	)
+
 	When("fails to read Machine's MAC address", func() {
 		BeforeEach(func() {
 			mockMachine.EXPECT().
@@ -152,7 +185,7 @@ var _ = Describe("AppStore (Login)", func() {
 				mockClient.EXPECT().
 					Send(gomock.Any()).
 					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal(testAuthEndpoint))
+						Expect(req.URL).To(Equal(testAuthEndpoint + "/"))
 						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
 					}).
 					Return(http.Result[loginResult]{}, clientErr)
@@ -274,61 +307,132 @@ var _ = Describe("AppStore (Login)", func() {
 			})
 		})
 
-		When("store API redirects", func() {
-			const (
-				testRedirectLocation = "https://p42-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
-			)
-
-			BeforeEach(func() {
-				firstCall := mockClient.EXPECT().
-					Send(gomock.Any()).
-					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal(testAuthEndpoint))
+		DescribeTable("follows authentication pod redirects with the same signed POST body",
+			func(status int) {
+				const podURL = "https://p42-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
+				jar, err := cookiejar.New(nil)
+				Expect(err).NotTo(HaveOccurred())
+				client := http.NewClient[loginResult](http.Args{CookieJar: loginSessionJar{jar}, Authentication: true})
+				bodies := make(chan []byte, 2)
+				var serverCalls atomic.Int32
+				srv := httptest.NewServer(gohttp.HandlerFunc(func(w gohttp.ResponseWriter, req *gohttp.Request) {
+					defer GinkgoRecover()
+					call := serverCalls.Add(1)
+					Expect(req.Method).To(Equal(gohttp.MethodPost))
+					Expect(req.Header.Get("Content-Type")).To(Equal("application/x-www-form-urlencoded"))
+					body, err := io.ReadAll(req.Body)
+					Expect(err).NotTo(HaveOccurred())
+					signature, err := base64.StdEncoding.DecodeString(req.Header.Get(http.HeaderAppleActionSignature))
+					Expect(err).NotTo(HaveOccurred())
+					// The stub signer returns its input, so this verifies that each
+					// POST is signed over the bytes actually sent by the HTTP client.
+					Expect(signature).To(Equal(body))
+					var payload map[string]string
+					_, err = plist.Unmarshal(body, &payload)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(payload).To(Equal(map[string]string{
+						"appleId": testEmail, "password": testPassword + "123456",
+						"attempt": "1", "guid": "000000000000", "rmp": "0", "why": "signIn",
+					}))
+					bodies <- append([]byte(nil), body...)
+					if call == 1 {
+						w.Header().Set("Location", podURL)
+						w.WriteHeader(status)
+						return
+					}
+					Expect(call).To(Equal(int32(2)))
+					w.Header().Set(HTTPHeaderStoreFront, "test-storefront")
+					w.Header().Set(HTTPHeaderPod, testPod)
+					_, err = w.Write([]byte("<dict><key>passwordToken</key><string>test-token</string><key>dsPersonId</key><string>test-id</string></dict>"))
+					Expect(err).NotTo(HaveOccurred())
+				}))
+				DeferCleanup(srv.Close)
+				adaptedCalls := 0
+				mockClient.EXPECT().Send(gomock.Any()).
+					DoAndReturn(func(req http.Request) (http.Result[loginResult], error) {
+						adaptedCalls++
+						Expect(req.URL).To(Equal([]string{testAuthEndpoint + "/", podURL}[adaptedCalls-1]))
 						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
-						Expect(req.Payload).To(BeAssignableToTypeOf(&http.XMLPayload{}))
-						x := req.Payload.(*http.XMLPayload)
-						Expect(x.Content).To(HaveKeyWithValue("attempt", "1"))
-					}).
-					Return(http.Result[loginResult]{
-						StatusCode: 302,
-						Headers:    map[string]string{"Location": testRedirectLocation},
-					}, nil)
-				secondCall := mockClient.EXPECT().
-					Send(gomock.Any()).
-					Do(func(req http.Request) {
-						Expect(req.URL).To(Equal(testRedirectLocation))
-						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
-						Expect(req.Payload).To(BeAssignableToTypeOf(&http.XMLPayload{}))
-						x := req.Payload.(*http.XMLPayload)
-						Expect(x.Content).To(HaveKeyWithValue("attempt", "1"))
-					}).
-					Return(http.Result[loginResult]{}, errors.New("test complete"))
-				gomock.InOrder(firstCall, secondCall)
-			})
+						// Validate the advertised Apple URL in login, but send every
+						// test request to the loopback server instead of Apple.
+						req.URL = srv.URL + PrivateAppStoreAPIPathAuth
+						return client.Send(req)
+					}).Times(2)
+				mockKeychain.EXPECT().Set("account", gomock.Any()).Return(nil).Times(1)
 
-			It("follows the redirect while preserving the original request body", func() {
-				_, err := as.Login(LoginInput{
-					Password: testPassword,
-				})
-				Expect(err).To(MatchError("sign-in at Store pod request failed: test complete"))
-			})
-		})
+				out, err := as.Login(LoginInput{Email: testEmail, Password: testPassword, AuthCode: "123 456"})
 
-		When("store API redirects outside Apple's authentication pods", func() {
-			BeforeEach(func() {
+				Expect(err).NotTo(HaveOccurred())
+				Expect(out.Account.PasswordToken).To(Equal("test-token"))
+				Expect(out.Account.Pod).To(Equal(testPod))
+				Expect(serverCalls.Load()).To(Equal(int32(2)))
+				Expect(<-bodies).To(Equal(<-bodies))
+				Expect(signer.closeCalls).To(Equal(1))
+			},
+			Entry("HTTP 301", gohttp.StatusMovedPermanently),
+			Entry("HTTP 302 regression", gohttp.StatusFound),
+		)
+
+		DescribeTable("rejects invalid redirects before reposting credentials",
+			func(status int, headers map[string]string, message string) {
 				mockClient.EXPECT().
 					Send(gomock.Any()).
 					Return(http.Result[loginResult]{
-						StatusCode: 302,
-						Headers:    map[string]string{"Location": "https://example.com/steal"},
-					}, nil)
-			})
+						StatusCode: status,
+						Headers:    headers,
+					}, nil).Times(1)
+				mockKeychain.EXPECT().Set(gomock.Any(), gomock.Any()).Times(0)
 
-			It("rejects the redirect before reposting credentials", func() {
-				_, err := as.Login(LoginInput{Password: testPassword})
-				Expect(err).To(MatchError(ContainSubstring("invalid authentication redirect")))
-			})
-		})
+				_, err := as.Login(LoginInput{Email: testEmail, Password: testPassword})
+
+				Expect(err).To(MatchError(ContainSubstring(message)))
+				Expect(signer.closeCalls).To(Equal(1))
+			},
+			Entry("301 rejects HTTP", 301, map[string]string{"Location": "http://p42-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"}, "invalid authentication redirect"),
+			Entry("301 rejects a non-Apple host", 301, map[string]string{"Location": "https://p42-buy.itunes.apple.com.example.test/WebObjects/MZFinance.woa/wa/authenticate"}, "invalid authentication redirect"),
+			Entry("301 rejects the wrong path", 301, map[string]string{"Location": "https://p42-buy.itunes.apple.com/steal"}, "invalid authentication redirect"),
+			Entry("301 rejects a missing Location", 301, map[string]string{}, "failed to retrieve redirect location"),
+			Entry("302 rejects HTTP", 302, map[string]string{"Location": "http://p42-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"}, "invalid authentication redirect"),
+			Entry("302 rejects a non-Apple host", 302, map[string]string{"Location": "https://p42-buy.itunes.apple.com.example.test/WebObjects/MZFinance.woa/wa/authenticate"}, "invalid authentication redirect"),
+			Entry("302 rejects the wrong path", 302, map[string]string{"Location": "https://p42-buy.itunes.apple.com/steal"}, "invalid authentication redirect"),
+			Entry("302 rejects a missing Location", 302, map[string]string{}, "failed to retrieve redirect location"),
+		)
+
+		DescribeTable("stops an authentication redirect loop after four requests",
+			func(status int) {
+				const redirectLocation = testAuthEndpoint + "?authToken=SENTINEL_AUTH_TOKEN"
+				mockClient.EXPECT().Send(gomock.Any()).
+					Do(func(req http.Request) {
+						Expect(req.Method).To(Equal(http.MethodPOST))
+						Expect(req.ActionSigner).To(BeIdenticalTo(signer))
+						Expect(req.Payload.(*http.XMLPayload).Content).To(HaveKeyWithValue("attempt", "1"))
+					}).
+					Return(http.Result[loginResult]{
+						StatusCode: status,
+						Headers: map[string]string{
+							"Location":   redirectLocation,
+							"Set-Cookie": "session=SENTINEL_COOKIE; Secure; HttpOnly",
+						},
+					}, nil).Times(4)
+				mockKeychain.EXPECT().Set(gomock.Any(), gomock.Any()).Times(0)
+
+				_, err := as.Login(LoginInput{Email: testEmail, Password: testPassword})
+
+				Expect(err).To(MatchError(fmt.Sprintf("too many attempts (authentication HTTP %d)", status)))
+				var metadataErr *Error
+				Expect(errors.As(err, &metadataErr)).To(BeFalse())
+				Expect(metadataErr).To(BeNil())
+				encodedError, marshalErr := json.Marshal(err)
+				Expect(marshalErr).NotTo(HaveOccurred())
+				for _, secret := range []string{"SENTINEL_AUTH_TOKEN", "SENTINEL_COOKIE"} {
+					Expect(err.Error()).NotTo(ContainSubstring(secret))
+					Expect(string(encodedError)).NotTo(ContainSubstring(secret))
+				}
+				Expect(signer.closeCalls).To(Equal(1))
+			},
+			Entry("HTTP 301", gohttp.StatusMovedPermanently),
+			Entry("HTTP 302 regression", gohttp.StatusFound),
+		)
 
 		When("store API returns valid response", func() {
 			const (

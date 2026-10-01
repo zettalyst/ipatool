@@ -52,6 +52,13 @@ func (t *appstore) bag(guid string) (BagOutput, error) {
 	if err := validateSAPConfig(config); err != nil {
 		return BagOutput{}, err
 	}
+	// The legacy endpoint in the bag omits the slash required by the
+	// authentication handler. Normalize only this initial bag URL; pod
+	// redirects are validated and replayed exactly as supplied by Apple.
+	config.AuthEndpoint, err = normalizeBagAuthenticationEndpoint(config.AuthEndpoint)
+	if err != nil {
+		return BagOutput{}, err
+	}
 
 	return BagOutput{AuthEndpoint: config.AuthEndpoint, SAPConfig: config}, nil
 }
@@ -121,11 +128,29 @@ func validateAuthenticationEndpoint(endpoint string) error {
 		return fmt.Errorf("unsupported authentication endpoint %q", endpoint)
 	}
 
-	if parsed.Path != PrivateAppStoreAPIPathAuth {
+	if parsed.Path != PrivateAppStoreAPIPathAuth && parsed.Path != PrivateAppStoreAPIPathAuth+"/" {
 		return fmt.Errorf("unsupported authentication endpoint %q", endpoint)
 	}
 
 	return nil
+}
+
+func normalizeBagAuthenticationEndpoint(endpoint string) (string, error) {
+	if err := validateAuthenticationEndpoint(endpoint); err != nil {
+		return "", err
+	}
+	parsed, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid authentication endpoint %q", endpoint)
+	}
+	if parsed.Path == PrivateAppStoreAPIPathAuth+"/" {
+		return endpoint, nil
+	}
+	parsed.Path += "/"
+	if parsed.RawPath != "" {
+		parsed.RawPath += "/"
+	}
+	return parsed.String(), nil
 }
 
 func (*appstore) bagRequest(guid string) http.Request {

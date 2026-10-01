@@ -3,10 +3,12 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/avast/retry-go"
 	"github.com/majd/ipatool/v2/pkg/appstore"
+	"github.com/majd/ipatool/v2/pkg/authdiag"
 	"github.com/spf13/cobra"
 )
 
@@ -29,7 +31,21 @@ func loginCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Login to the App Store",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			if diagnosticPath := os.Getenv("IPATOOL_AUTH_DIAGNOSTICS"); diagnosticPath != "" {
+				if err := authdiag.Start(diagnosticPath); err != nil {
+					return err
+				}
+				authdiag.Emit(authdiag.Event{Kind: "diagnostic_started"})
+				defer func() {
+					outcome := "ok"
+					if runErr != nil {
+						outcome = "error"
+					}
+					authdiag.Emit(authdiag.Event{Kind: "diagnostic_finished", Outcome: outcome})
+					runErr = errors.Join(runErr, authdiag.Close())
+				}()
+			}
 			interactive := cmd.Context().Value(interactiveKey).(bool)
 
 			if email == "" && !interactive {
@@ -64,7 +80,7 @@ func loginCmd() *cobra.Command {
 			return retry.Do(func() error {
 				if errors.Is(lastErr, appstore.ErrAuthCodeRequired) && interactive {
 					var err error
-					authCode, err = readPrompt("enter 2FA code: ", false)
+					authCode, err = readPrompt("enter 2FA code: ", true)
 					if err != nil {
 						return fmt.Errorf("failed to read auth code: %w", err)
 					}
@@ -90,6 +106,10 @@ func loginCmd() *cobra.Command {
 					return err
 				}
 
+				if authdiag.Enabled() {
+					dependencies.Logger.Log().Bool("success", true).Msg("authentication completed")
+					return nil
+				}
 				dependencies.Logger.Log().
 					Str("name", output.Account.Name).
 					Str("email", output.Account.Email).

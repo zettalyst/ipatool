@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	gohttp "net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/majd/ipatool/v2/pkg/authdiag"
 	"github.com/majd/ipatool/v2/pkg/http"
 	"github.com/majd/ipatool/v2/pkg/util"
 )
@@ -36,7 +38,22 @@ type LoginOutput struct {
 	Account Account
 }
 
-func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
+func (t *appstore) Login(input LoginInput) (output LoginOutput, resultErr error) {
+	loginID := authdiag.NextLoginID()
+	stage := "sign-in"
+	if input.AuthCode != "" {
+		stage = "2fa"
+	}
+	authdiag.Emit(authdiag.Event{Kind: "login_started", LoginID: loginID, Stage: stage})
+	defer func() {
+		outcome := "ok"
+		if errors.Is(resultErr, ErrAuthCodeRequired) {
+			outcome = "challenge"
+		} else if resultErr != nil {
+			outcome = "error"
+		}
+		authdiag.Emit(authdiag.Event{Kind: "login_finished", LoginID: loginID, Stage: stage, Outcome: outcome})
+	}()
 	macAddr, err := t.machine.MacAddress()
 	if err != nil {
 		return LoginOutput{}, fmt.Errorf("failed to get mac address: %w", err)
@@ -52,6 +69,8 @@ func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
 		return LoginOutput{}, fmt.Errorf("failed to get bag: %w", err)
 	}
 
+	authdiag.Emit(authdiag.Event{Kind: "bag_completed", LoginID: loginID, Stage: stage, Host: authdiag.Host(bag.SAPConfig.AuthEndpoint), Outcome: "ok"})
+
 	if t.actionSignerFactory == nil {
 		return LoginOutput{}, errors.New("SAP action signer is not configured")
 	}
@@ -65,8 +84,14 @@ func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
 		return LoginOutput{}, errors.New("SAP action signer factory returned nil")
 	}
 
-	acc, loginErr := t.login(input.Email, input.Password, input.AuthCode, guid, bag.SAPConfig.AuthEndpoint, signer)
+	authdiag.Emit(authdiag.Event{Kind: "signer_ready", LoginID: loginID, Stage: stage, Outcome: "ok"})
+	acc, loginErr := t.loginWithDiagnostic(input.Email, input.Password, input.AuthCode, guid, bag.SAPConfig.AuthEndpoint, signer, loginID)
 	closeErr := signer.Close()
+	closeOutcome := "ok"
+	if closeErr != nil {
+		closeOutcome = "error"
+	}
+	authdiag.Emit(authdiag.Event{Kind: "signer_closed", LoginID: loginID, Stage: stage, Outcome: closeOutcome})
 
 	if closeErr != nil {
 		closeErr = fmt.Errorf("failed to close SAP action signer: %w", closeErr)
@@ -80,7 +105,7 @@ func (t *appstore) Login(input LoginInput) (LoginOutput, error) {
 		return LoginOutput{}, loginErr
 	}
 
-	output := LoginOutput{Account: acc}
+	output = LoginOutput{Account: acc}
 	if closeErr != nil {
 		return output, closeErr
 	}
@@ -107,6 +132,14 @@ type loginResult struct {
 }
 
 func (t *appstore) login(email, password, authCode, guid, endpoint string, signer ActionSigner) (Account, error) {
+	return t.loginWithDiagnostic(email, password, authCode, guid, endpoint, signer, 0)
+}
+
+func (t *appstore) loginWithDiagnostic(email, password, authCode, guid, endpoint string, signer ActionSigner, loginID uint64) (Account, error) {
+	stage := "sign-in"
+	if authCode != "" {
+		stage = "2fa"
+	}
 	redirect := ""
 
 	var (
@@ -126,6 +159,10 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string, signe
 
 		request := t.loginRequest(email, password, authCode, guid, endpoint, requestAttempt, signer)
 		request.URL, _ = util.IfEmpty(redirect, request.URL), ""
+		if authdiag.Enabled() {
+			request.DiagnosticLoginID, request.DiagnosticStage, request.DiagnosticAttempt = loginID, stage, attempt
+		}
+		authdiag.Emit(authdiag.Event{Kind: "login_request", LoginID: loginID, Stage: stage, Attempt: attempt, Host: authdiag.Host(request.URL)})
 		res, err = t.sendAuthenticationRequest(request)
 
 		if err != nil {
@@ -141,13 +178,21 @@ func (t *appstore) login(email, password, authCode, guid, endpoint string, signe
 			return Account{}, fmt.Errorf("%s request failed: %w", stage, err)
 		}
 
-		if retry, redirect, err = t.parseLoginResponse(&res, attempt, authCode); err != nil {
+		retry, redirect, err = t.parseLoginResponse(&res, attempt, authCode)
+		outcome := "ok"
+		if errors.Is(err, ErrAuthCodeRequired) {
+			outcome = "challenge"
+		} else if err != nil {
+			outcome = "error"
+		}
+		authdiag.Emit(authdiag.Event{Kind: "login_response", LoginID: loginID, Stage: stage, Attempt: attempt, Status: res.StatusCode, Outcome: outcome, FailureTypePresent: res.Data.FailureType != "", PasswordTokenPresent: res.Data.PasswordToken != "", DirectoryServicesIDPresent: res.Data.DirectoryServicesID != ""})
+		if err != nil {
 			return Account{}, err
 		}
 	}
 
 	if retry {
-		return Account{}, NewErrorWithMetadata(errors.New("too many attempts"), res)
+		return Account{}, fmt.Errorf("too many attempts (authentication HTTP %d)", res.StatusCode)
 	}
 
 	sf, err := res.GetHeader(HTTPHeaderStoreFront)
@@ -193,6 +238,9 @@ func (t *appstore) sendAuthenticationRequest(request http.Request) (http.Result[
 	}
 
 	for attempt := 1; ; attempt++ {
+		if authdiag.Enabled() {
+			request.DiagnosticRetry = attempt
+		}
 		result, err := t.loginClient.Send(request)
 
 		status, retry := retryableAuthenticationError(err)
@@ -227,6 +275,7 @@ func (t *appstore) sendAuthenticationRequest(request http.Request) (http.Result[
 			}
 		}
 
+		authdiag.Emit(authdiag.Event{Kind: "retry_wait", LoginID: request.DiagnosticLoginID, Stage: request.DiagnosticStage, Attempt: request.DiagnosticAttempt, Retry: attempt, Status: status, WaitMS: delay.Milliseconds()})
 		sleep(delay)
 	}
 }
@@ -253,11 +302,11 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 		err      error
 	)
 
-	if res.StatusCode == gohttp.StatusFound {
+	if res.StatusCode == gohttp.StatusFound || res.StatusCode == gohttp.StatusMovedPermanently {
 		if redirect, err = res.GetHeader("location"); err != nil {
 			err = fmt.Errorf("failed to retrieve redirect location: %w", err)
 		} else if err = validateAuthenticationEndpoint(redirect); err != nil {
-			err = fmt.Errorf("invalid authentication redirect: %w", err)
+			err = authenticationRedirectError(res.StatusCode, redirect)
 		} else {
 			retry = true
 		}
@@ -278,6 +327,19 @@ func (t *appstore) parseLoginResponse(res *http.Result[loginResult], attempt int
 	}
 
 	return retry, redirect, err
+}
+
+func authenticationRedirectError(status int, endpoint string) error {
+	// Location can contain account data. Report routing details without userinfo,
+	// query parameters, fragments, or an arbitrary path supplied by the server.
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid authentication redirect (HTTP %d): malformed Location", status)
+	}
+	return fmt.Errorf(
+		"invalid authentication redirect (HTTP %d): scheme=%q host=%q expected-auth-path=%t",
+		status, parsed.Scheme, parsed.Hostname(), (parsed.Path == PrivateAppStoreAPIPathAuth || parsed.Path == PrivateAppStoreAPIPathAuth+"/"),
+	)
 }
 
 func (t *appstore) loginRequest(email, password, authCode, guid, endpoint string, attempt int, signer ActionSigner) http.Request {

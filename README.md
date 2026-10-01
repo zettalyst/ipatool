@@ -1,3 +1,16 @@
+## This fork
+
+This fork preserves the authentication fix verified on macOS arm64 on 2026-10-02.
+The `codex/auth-trailing-slash` branch is based on upstream **v2.6.0**
+(`747d66fc0acd896759f43a206a7ddfa2ab49e584`) and builds as `2.6.0-localroute`.
+It normalizes the initial authentication URL, handles validated 301/302 redirects,
+and adds opt-in diagnostics that exclude credential values.
+
+See [the fix, experiments, build instructions, and validation limits](docs/authentication-fix.md).
+Build this branch to use the patch: the upstream releases and Homebrew package
+linked below do not contain this fork's changes. Upstream attribution and the MIT
+license are retained.
+
 <p align="center">
   <a href="https://GitHub.com/majd/ipatool/releases/"><img src="https://img.shields.io/github/release/majd/ipatool.svg?label=Release" alt="Release"></a>
   <a href="https://github.com/majd/ipatool/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License"></a>
@@ -75,12 +88,15 @@ The tool can be compiled using the Go toolchain.
 $ go build -o ipatool
 ```
 
-Unit tests can be executed with the following commands.
+The focused authentication tests can be executed with the following commands.
 
 ```shell
 $ go generate ./...
-$ go test -v ./...
+$ go test -count=1 -v ./cmd ./pkg/authdiag ./pkg/appstore ./pkg/http
 ```
+
+The broader `go test ./...` command also includes upstream SAP integration tests
+that can contact Apple. It is not an offline-only test command.
 
 ## License
 

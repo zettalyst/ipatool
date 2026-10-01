@@ -177,7 +177,7 @@ func validBagResult() bagResult {
 
 func validSAPConfig() SAPConfig {
 	return SAPConfig{
-		AuthEndpoint:   testAuthEndpoint,
+		AuthEndpoint:   testAuthEndpoint + "/",
 		SetupURL:       testSAPSetupEndpoint,
 		CertificateURL: testSAPSetupCertEndpoint,
 		Version:        200,
